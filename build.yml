@@ -1,0 +1,1266 @@
+name: build
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.5
+      - name: Generate project
+        run: |
+          cat > build.gradle <<'EOF_FILE'
+          plugins {
+              id 'fabric-loom' version '1.5-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 17 }
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF_FILE
+          cat > gradle.properties <<'EOF_FILE'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.20.1
+          yarn_mappings=1.20.1+build.10
+          loader_version=0.15.11
+          fabric_version=0.92.2+1.20.1
+          mod_version=1.4.0
+          maven_group=com.bob
+          archives_base_name=visualmod
+          EOF_FILE
+          cat > settings.gradle <<'EOF_FILE'
+          pluginManagement {
+              repositories {
+                  maven { url 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/bob/visual
+          cat > src/main/java/com/bob/visual/VisualClient.java <<'EOF_FILE'
+          package com.bob.visual;
+
+          import com.bob.visual.gui.ClickGuiScreen;
+          import com.bob.visual.module.ModuleManager;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import org.lwjgl.glfw.GLFW;
+
+          public class VisualClient implements ClientModInitializer {
+              public static KeyBinding openKey;
+
+              @Override
+              public void onInitializeClient() {
+                  openKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                          "key.visual.open", InputUtil.Type.KEYSYM,
+                          GLFW.GLFW_KEY_RIGHT_SHIFT, "category.visual"));
+
+                  ModuleManager.init();
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (openKey.wasPressed()) {
+                          client.setScreen(new ClickGuiScreen());
+                      }
+                      ModuleManager.tick();
+                  });
+
+                  HudRenderCallback.EVENT.register((ctx, tickDelta) -> ModuleManager.render(ctx));
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/bob/visual/gui
+          cat > src/main/java/com/bob/visual/gui/ClickGuiScreen.java <<'EOF_FILE'
+          package com.bob.visual.gui;
+
+          import com.bob.visual.module.Module;
+          import com.bob.visual.module.ModuleManager;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class ClickGuiScreen extends Screen {
+              private static final int PX = 10, PY = 12, W = 100, GAP = 6, HEAD = 16, ROW = 14;
+
+              private double scroll = 0;
+
+              public ClickGuiScreen() { super(Text.literal("Visual")); }
+
+              @Override public boolean shouldPause() { return false; }
+
+              private static String title(Module.Category c) {
+                  return switch (c) {
+                      case INFO -> "Info";
+                      case HUD -> "HUD";
+                      case VISUAL -> "Visual";
+                      case MISC -> "Misc";
+                  };
+              }
+
+              private static int count(Module.Category c) {
+                  int n = 0;
+                  for (Module m : ModuleManager.MODULES) if (m.category == c) n++;
+                  return n;
+              }
+
+              private int maxHeight() {
+                  int max = 0;
+                  for (Module.Category c : Module.Category.values()) max = Math.max(max, count(c));
+                  return PY + HEAD + max * ROW + 10;
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  int sy = (int) scroll;
+                  int i = 0;
+                  for (Module.Category c : Module.Category.values()) {
+                      int px = PX + i * (W + GAP);
+                      ctx.fill(px, PY + sy, px + W, PY + sy + HEAD, 0xFF6A3DE8);
+                      ctx.drawTextWithShadow(textRenderer, title(c), px + 6, PY + sy + 4, 0xFFFFFF);
+                      int y = PY + sy + HEAD;
+                      for (Module m : ModuleManager.MODULES) {
+                          if (m.category != c) continue;
+                          boolean hover = mouseX >= px && mouseX < px + W && mouseY >= y && mouseY < y + ROW;
+                          int bg = m.enabled ? 0xFF3B2A7A : (hover ? 0xE0303030 : 0xE0181818);
+                          ctx.fill(px, y, px + W, y + ROW, bg);
+                          ctx.drawTextWithShadow(textRenderer, m.name, px + 6, y + 3,
+                                  m.enabled ? 0xFFFFFF : 0xAAAAAA);
+                          y += ROW;
+                      }
+                      i++;
+                  }
+                  super.render(ctx, mouseX, mouseY, delta);
+              }
+
+              @Override
+              public boolean mouseClicked(double mx, double my, int button) {
+                  if (button == 0) {
+                      int sy = (int) scroll;
+                      int i = 0;
+                      for (Module.Category c : Module.Category.values()) {
+                          int px = PX + i * (W + GAP);
+                          int y = PY + sy + HEAD;
+                          for (Module m : ModuleManager.MODULES) {
+                              if (m.category != c) continue;
+                              if (mx >= px && mx < px + W && my >= y && my < y + ROW) {
+                                  m.toggle();
+                                  return true;
+                              }
+                              y += ROW;
+                          }
+                          i++;
+                      }
+                  }
+                  return super.mouseClicked(mx, my, button);
+              }
+
+              @Override
+              public boolean mouseScrolled(double mx, double my, double amount) {
+                  double min = Math.min(0, height - maxHeight());
+                  scroll = Math.max(min, Math.min(0, scroll + amount * ROW * 2));
+                  return true;
+              }
+
+              @Override
+              public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+                  if (keyCode == GLFW.GLFW_KEY_RIGHT_SHIFT) { close(); return true; }
+                  return super.keyPressed(keyCode, scanCode, modifiers);
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/bob/visual/module
+          cat > src/main/java/com/bob/visual/module/Module.java <<'EOF_FILE'
+          package com.bob.visual.module;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+
+          import java.util.List;
+
+          public abstract class Module {
+              public enum Category { INFO, HUD, VISUAL, MISC }
+
+              protected static final MinecraftClient mc = MinecraftClient.getInstance();
+
+              public final String name;
+              public final Category category;
+              public boolean enabled;
+
+              protected Module(String name, Category category) {
+                  this.name = name;
+                  this.category = category;
+              }
+
+              /** Включить по умолчанию (без вызова onEnable). */
+              public Module on() {
+                  enabled = true;
+                  return this;
+              }
+
+              public void toggle() {
+                  enabled = !enabled;
+                  if (enabled) onEnable(); else onDisable();
+              }
+
+              /** Одна строка текста для левого списка. null = ничего не показывать. */
+              public String info() { return null; }
+
+              /** Несколько строк для левого списка. */
+              public List<String> lines() {
+                  String s = info();
+                  return s == null ? null : List.of(s);
+              }
+
+              public void onEnable() {}
+              public void onDisable() {}
+              public void onTick() {}
+              public void onRender(DrawContext ctx, int w, int h) {}
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/bob/visual/module
+          cat > src/main/java/com/bob/visual/module/ModuleManager.java <<'EOF_FILE'
+          package com.bob.visual.module;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.util.math.MathHelper;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class ModuleManager {
+              public static final List<Module> MODULES = new ArrayList<>();
+              public static boolean rainbow = false;
+
+              public static void init() {
+                  // INFO (текст слева)
+                  MODULES.add(new Modules.FpsHud().on());
+                  MODULES.add(new Modules.PingHud());
+                  MODULES.add(new Modules.CoordsHud().on());
+                  MODULES.add(new Modules.NetherCoords());
+                  MODULES.add(new Modules.DirectionHud());
+                  MODULES.add(new Modules.RotationHud());
+                  MODULES.add(new Modules.SpeedHud());
+                  MODULES.add(new Modules.CpsHud().on());
+                  MODULES.add(new Modules.ClockHud());
+                  MODULES.add(new Modules.SessionHud());
+                  MODULES.add(new Modules.MemoryHud());
+                  MODULES.add(new Modules.BiomeHud());
+                  MODULES.add(new Modules.LightHud());
+                  MODULES.add(new Modules.DayHud());
+                  MODULES.add(new Modules.ServerHud());
+                  MODULES.add(new Modules.HealthHud());
+                  MODULES.add(new Modules.HungerHud());
+                  MODULES.add(new Modules.XpHud());
+                  MODULES.add(new Modules.HeldItemHud());
+                  MODULES.add(new Modules.PotionHud().on());
+                  MODULES.add(new Modules.DateHud());
+                  MODULES.add(new Modules.MoonHud());
+                  MODULES.add(new Modules.PlayersHud());
+                  MODULES.add(new Modules.BlockInfo());
+                  MODULES.add(new Modules.FreeSlots());
+                  MODULES.add(new Modules.Cooldowns());
+                  MODULES.add(new Modules.TargetName());
+                  MODULES.add(new Modules.EntityCount());
+                  MODULES.add(new Modules.ChunkHud());
+                  MODULES.add(new Modules.DimensionHud());
+                  MODULES.add(new Modules.GamemodeHud());
+                  MODULES.add(new Modules.FallHud());
+                  MODULES.add(new Modules.AirHud());
+                  MODULES.add(new Modules.ArmorValueHud());
+                  MODULES.add(new Modules.AttackCooldownHud());
+                  MODULES.add(new Modules.WeatherHud());
+                  MODULES.add(new Modules.ResolutionHud());
+                  MODULES.add(new Modules.MovementHud());
+                  // HUD (элементы)
+                  MODULES.add(new Modules.Keystrokes().on());
+                  MODULES.add(new Modules.ArmorHud().on());
+                  MODULES.add(new Modules.ItemCounter());
+                  MODULES.add(new Modules.TargetHud());
+                  MODULES.add(new Modules.InventoryHud());
+                  MODULES.add(new Modules.CenterDot());
+                  MODULES.add(new Modules.LowHpWarning());
+                  MODULES.add(new Modules.DurabilityWarning());
+                  MODULES.add(new Modules.CustomCrosshair());
+                  MODULES.add(new Modules.OffhandHud());
+                  MODULES.add(new Modules.HealthBar());
+                  MODULES.add(new Modules.Compass());
+                  MODULES.add(new Modules.FpsGraph());
+                  // VISUAL
+                  MODULES.add(new Modules.Watermark().on());
+                  MODULES.add(new Modules.ArrayListHud().on());
+                  MODULES.add(new Modules.Rainbow());
+                  MODULES.add(new Modules.Fullbright());
+                  MODULES.add(new Modules.Zoom());
+                  MODULES.add(new Modules.WideFov());
+                  MODULES.add(new Modules.AlwaysDay());
+                  MODULES.add(new Modules.AlwaysNight());
+                  MODULES.add(new Modules.NoRain());
+                  MODULES.add(new Modules.Hitboxes());
+                  MODULES.add(new Modules.MinimalParticles());
+                  MODULES.add(new Modules.NoClouds());
+                  MODULES.add(new Modules.NoBobbing());
+                  MODULES.add(new Modules.NoShadows());
+                  MODULES.add(new Modules.StaticFov());
+                  MODULES.add(new Modules.ClearChat());
+                  MODULES.add(new Modules.FastGraphics());
+                  MODULES.add(new Modules.UnlimitedFps());
+                  MODULES.add(new Modules.VsyncOff());
+                  // MISC
+                  MODULES.add(new Modules.ToggleSprint());
+                  MODULES.add(new Modules.ToggleSneak());
+                  MODULES.add(new Modules.AutoRespawn());
+                  MODULES.add(new Modules.AutoJumpOff());
+                  MODULES.add(new Modules.MuteMusic());
+              }
+
+              /** Выключает все модули данного класса (с вызовом onDisable). */
+              public static void off(Class<? extends Module> c) {
+                  for (Module m : MODULES) {
+                      if (c.isInstance(m) && m.enabled) m.toggle();
+                  }
+              }
+
+              public static int color(int i) {
+                  if (!rainbow) return 0xFFFFFF;
+                  float hue = ((System.currentTimeMillis() % 4000L) / 4000f + i * 0.04f) % 1f;
+                  return MathHelper.hsvToRgb(hue, 0.6f, 1f) | 0xFF000000;
+              }
+
+              public static void tick() {
+                  for (Module m : MODULES) if (m.enabled) m.onTick();
+              }
+
+              public static void render(DrawContext ctx) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.player == null || mc.world == null || mc.options.hudHidden) return;
+                  int w = mc.getWindow().getScaledWidth();
+                  int h = mc.getWindow().getScaledHeight();
+
+                  int line = 0;
+                  for (Module m : MODULES) {
+                      if (!m.enabled) continue;
+                      List<String> ls = m.lines();
+                      if (ls == null) continue;
+                      for (String s : ls) {
+                          ctx.drawTextWithShadow(mc.textRenderer, s, 4, 4 + line * 11, color(line));
+                          line++;
+                      }
+                  }
+                  for (Module m : MODULES) if (m.enabled) m.onRender(ctx, w, h);
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/java/com/bob/visual/module
+          cat > src/main/java/com/bob/visual/module/Modules.java <<'EOF_FILE'
+          package com.bob.visual.module;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.DeathScreen;
+          import net.minecraft.client.network.PlayerListEntry;
+          import net.minecraft.client.option.CloudRenderMode;
+          import net.minecraft.client.option.GraphicsMode;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.option.ParticlesMode;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.entity.effect.StatusEffects;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.sound.SoundCategory;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.hit.HitResult;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.world.World;
+
+          import java.time.LocalDate;
+          import java.time.LocalTime;
+          import java.time.format.DateTimeFormatter;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Deque;
+          import java.util.List;
+
+          public final class Modules {
+              private Modules() {}
+
+              private static final long START = System.currentTimeMillis();
+
+              // ============================ INFO ============================
+
+              public static class FpsHud extends Module {
+                  public FpsHud() { super("FPS", Category.INFO); }
+                  @Override public String info() { return "FPS: " + mc.getCurrentFps(); }
+              }
+
+              public static class PingHud extends Module {
+                  public PingHud() { super("Ping", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null || mc.getNetworkHandler() == null) return null;
+                      PlayerListEntry e = mc.getNetworkHandler().getPlayerListEntry(mc.player.getUuid());
+                      return "Ping: " + (e == null ? 0 : e.getLatency()) + " ms";
+                  }
+              }
+
+              public static class CoordsHud extends Module {
+                  public CoordsHud() { super("Coordinates", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return String.format("XYZ: %.1f / %.1f / %.1f",
+                              mc.player.getX(), mc.player.getY(), mc.player.getZ());
+                  }
+              }
+
+              public static class NetherCoords extends Module {
+                  public NetherCoords() { super("Nether Coords", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null || mc.world == null) return null;
+                      boolean nether = mc.world.getRegistryKey() == World.NETHER;
+                      double f = nether ? 8.0 : 0.125;
+                      return String.format("%s: %.1f / %.1f", nether ? "Overworld" : "Nether",
+                              mc.player.getX() * f, mc.player.getZ() * f);
+                  }
+              }
+
+              public static class DirectionHud extends Module {
+                  public DirectionHud() { super("Direction", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return "Facing: " + mc.player.getHorizontalFacing().asString();
+                  }
+              }
+
+              public static class RotationHud extends Module {
+                  public RotationHud() { super("Rotation", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return String.format("Yaw: %.1f  Pitch: %.1f",
+                              MathHelper.wrapDegrees(mc.player.getYaw()), mc.player.getPitch());
+                  }
+              }
+
+              public static class SpeedHud extends Module {
+                  private double px, pz, bps;
+                  public SpeedHud() { super("Speed", Category.INFO); }
+                  @Override public void onTick() {
+                      if (mc.player == null) return;
+                      double dx = mc.player.getX() - px;
+                      double dz = mc.player.getZ() - pz;
+                      bps = bps * 0.8 + Math.hypot(dx, dz) * 20.0 * 0.2;
+                      px = mc.player.getX();
+                      pz = mc.player.getZ();
+                  }
+                  @Override public String info() { return String.format("Speed: %.1f b/s", bps); }
+              }
+
+              /** CPS считается по тикам, поэтому приблизительно. */
+              public static class CpsHud extends Module {
+                  private final Deque<Long> left = new ArrayDeque<>();
+                  private final Deque<Long> right = new ArrayDeque<>();
+                  private boolean lastL, lastR;
+
+                  public CpsHud() { super("CPS", Category.INFO); }
+
+                  @Override public void onTick() {
+                      long now = System.currentTimeMillis();
+                      boolean l = mc.options.attackKey.isPressed();
+                      boolean r = mc.options.useKey.isPressed();
+                      if (l && !lastL) left.add(now);
+                      if (r && !lastR) right.add(now);
+                      lastL = l;
+                      lastR = r;
+                      while (!left.isEmpty() && now - left.peekFirst() > 1000) left.pollFirst();
+                      while (!right.isEmpty() && now - right.peekFirst() > 1000) right.pollFirst();
+                  }
+
+                  @Override public String info() { return "CPS: " + left.size() + " | " + right.size(); }
+              }
+
+              public static class ClockHud extends Module {
+                  private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
+                  public ClockHud() { super("Clock", Category.INFO); }
+                  @Override public String info() { return "Time: " + LocalTime.now().format(FMT); }
+              }
+
+              public static class SessionHud extends Module {
+                  public SessionHud() { super("Session", Category.INFO); }
+                  @Override public String info() {
+                      long s = (System.currentTimeMillis() - START) / 1000L;
+                      return String.format("Session: %d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60);
+                  }
+              }
+
+              public static class MemoryHud extends Module {
+                  public MemoryHud() { super("Memory", Category.INFO); }
+                  @Override public String info() {
+                      Runtime rt = Runtime.getRuntime();
+                      long used = (rt.totalMemory() - rt.freeMemory()) / 1048576L;
+                      long max = rt.maxMemory() / 1048576L;
+                      return "RAM: " + used + " / " + max + " MB";
+                  }
+              }
+
+              public static class BiomeHud extends Module {
+                  public BiomeHud() { super("Biome", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null || mc.world == null) return null;
+                      String b = mc.world.getBiome(mc.player.getBlockPos())
+                              .getKey().map(k -> k.getValue().getPath()).orElse("unknown");
+                      return "Biome: " + b;
+                  }
+              }
+
+              public static class LightHud extends Module {
+                  public LightHud() { super("Light", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null || mc.world == null) return null;
+                      return "Light: " + mc.world.getLightLevel(mc.player.getBlockPos());
+                  }
+              }
+
+              public static class DayHud extends Module {
+                  public DayHud() { super("Day", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.world == null) return null;
+                      return "Day: " + (mc.world.getTimeOfDay() / 24000L);
+                  }
+              }
+
+              public static class ServerHud extends Module {
+                  public ServerHud() { super("Server", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.getCurrentServerEntry() == null) return "Server: singleplayer";
+                      return "Server: " + mc.getCurrentServerEntry().address;
+                  }
+              }
+
+              public static class HealthHud extends Module {
+                  public HealthHud() { super("Health", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      float abs = mc.player.getAbsorptionAmount();
+                      return String.format("HP: %.1f", mc.player.getHealth())
+                              + (abs > 0 ? String.format(" (+%.1f)", abs) : "");
+                  }
+              }
+
+              public static class HungerHud extends Module {
+                  public HungerHud() { super("Hunger", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return String.format("Food: %d  Sat: %.1f",
+                              mc.player.getHungerManager().getFoodLevel(),
+                              mc.player.getHungerManager().getSaturationLevel());
+                  }
+              }
+
+              public static class XpHud extends Module {
+                  public XpHud() { super("XP", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return "XP level: " + mc.player.experienceLevel;
+                  }
+              }
+
+              public static class HeldItemHud extends Module {
+                  public HeldItemHud() { super("Held Item", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      ItemStack s = mc.player.getMainHandStack();
+                      if (s.isEmpty()) return null;
+                      String t = s.getName().getString();
+                      if (s.isDamageable()) t += " " + (s.getMaxDamage() - s.getDamage()) + "/" + s.getMaxDamage();
+                      else if (s.getCount() > 1) t += " x" + s.getCount();
+                      return t;
+                  }
+              }
+
+              public static class PotionHud extends Module {
+                  public PotionHud() { super("Potion HUD", Category.INFO); }
+                  @Override public List<String> lines() {
+                      if (mc.player == null) return null;
+                      List<String> out = new ArrayList<>();
+                      for (StatusEffectInstance e : mc.player.getStatusEffects()) {
+                          int sec = e.getDuration() / 20;
+                          String time = e.getDuration() < 0 ? "inf" : String.format("%d:%02d", sec / 60, sec % 60);
+                          out.add(e.getEffectType().getName().getString() + " " + (e.getAmplifier() + 1) + "  " + time);
+                      }
+                      return out.isEmpty() ? null : out;
+                  }
+              }
+
+              // ============================ HUD ============================
+
+              public static class Keystrokes extends Module {
+                  public Keystrokes() { super("Keystrokes", Category.HUD); }
+
+                  private void key(DrawContext ctx, String label, KeyBinding kb, int kx, int ky, int w) {
+                      boolean down = kb.isPressed();
+                      ctx.fill(kx, ky, kx + w, ky + 18, down ? 0xAAFFFFFF : 0x80000000);
+                      int tx = kx + (w - mc.textRenderer.getWidth(label)) / 2;
+                      ctx.drawText(mc.textRenderer, label, tx, ky + 5, down ? 0x000000 : 0xFFFFFF, false);
+                  }
+
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      int x = 6, y = h - 70;
+                      key(ctx, "W", mc.options.forwardKey, x + 20, y, 18);
+                      key(ctx, "A", mc.options.leftKey, x, y + 20, 18);
+                      key(ctx, "S", mc.options.backKey, x + 20, y + 20, 18);
+                      key(ctx, "D", mc.options.rightKey, x + 40, y + 20, 18);
+                      key(ctx, "LMB", mc.options.attackKey, x, y + 40, 29);
+                      key(ctx, "RMB", mc.options.useKey, x + 31, y + 40, 29);
+                  }
+              }
+
+              public static class ArmorHud extends Module {
+                  public ArmorHud() { super("Armor HUD", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      int x = w - 22, y = h / 2 - 36, i = 0;
+                      for (int slot = 3; slot >= 0; slot--) {
+                          ItemStack s = mc.player.getInventory().armor.get(slot);
+                          if (s.isEmpty()) continue;
+                          ctx.drawItem(s, x, y + i * 18);
+                          ctx.drawItemInSlot(mc.textRenderer, s, x, y + i * 18);
+                          i++;
+                      }
+                  }
+              }
+
+              public static class ItemCounter extends Module {
+                  public ItemCounter() { super("Item Counter", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      ItemStack[] icons = {
+                              new ItemStack(Items.TOTEM_OF_UNDYING),
+                              new ItemStack(Items.GOLDEN_APPLE),
+                              new ItemStack(Items.ENDER_PEARL)
+                      };
+                      int x = w - 50, y = h - 80;
+                      for (int i = 0; i < icons.length; i++) {
+                          int count = mc.player.getInventory().count(icons[i].getItem());
+                          ctx.drawItem(icons[i], x, y + i * 18);
+                          ctx.drawTextWithShadow(mc.textRenderer, "x" + count, x + 20, y + i * 18 + 5, 0xFFFFFF);
+                      }
+                  }
+              }
+
+              public static class TargetHud extends Module {
+                  public TargetHud() { super("Target HUD", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (!(mc.targetedEntity instanceof LivingEntity t)) return;
+                      int x = w / 2 + 14, y = h / 2 + 14, bw = 80;
+                      float hp = t.getHealth();
+                      float max = Math.max(1f, t.getMaxHealth());
+                      ctx.drawTextWithShadow(mc.textRenderer,
+                              t.getName().getString() + " " + String.format("%.1f", hp), x, y, 0xFFFFFF);
+                      ctx.fill(x, y + 11, x + bw, y + 15, 0xAA000000);
+                      ctx.fill(x, y + 11, x + (int) (bw * Math.min(1f, hp / max)), y + 15, 0xFF55FF55);
+                  }
+              }
+
+              /** Содержимое инвентаря на экране. */
+              public static class InventoryHud extends Module {
+                  public InventoryHud() { super("Inventory HUD", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      int x = 6, y = h - 132;
+                      ctx.fill(x - 2, y - 2, x + 9 * 18 + 2, y + 3 * 18 + 2, 0x80000000);
+                      for (int r = 0; r < 3; r++) {
+                          for (int c = 0; c < 9; c++) {
+                              ItemStack s = mc.player.getInventory().getStack(9 + r * 9 + c);
+                              if (s.isEmpty()) continue;
+                              ctx.drawItem(s, x + c * 18, y + r * 18);
+                              ctx.drawItemInSlot(mc.textRenderer, s, x + c * 18, y + r * 18);
+                          }
+                      }
+                  }
+              }
+
+              public static class CenterDot extends Module {
+                  public CenterDot() { super("Center Dot", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      int c = ModuleManager.rainbow ? ModuleManager.color(0) : 0xFFFF5555;
+                      ctx.fill(w / 2 - 1, h / 2 - 1, w / 2 + 1, h / 2 + 1, c | 0xFF000000);
+                  }
+              }
+
+              // ============================ VISUAL ============================
+
+              public static class Watermark extends Module {
+                  public Watermark() { super("Watermark", Category.VISUAL); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      String s = "Visual Mod";
+                      ctx.drawTextWithShadow(mc.textRenderer, s,
+                              (w - mc.textRenderer.getWidth(s)) / 2, 4, ModuleManager.color(0));
+                  }
+              }
+
+              public static class ArrayListHud extends Module {
+                  public ArrayListHud() { super("ArrayList", Category.VISUAL); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      List<Module> list = new ArrayList<>();
+                      for (Module m : ModuleManager.MODULES) {
+                          if (m.enabled && m != this && !(m instanceof Watermark)) list.add(m);
+                      }
+                      list.sort((a, b) -> mc.textRenderer.getWidth(b.name) - mc.textRenderer.getWidth(a.name));
+                      for (int i = 0; i < list.size(); i++) {
+                          String s = list.get(i).name;
+                          int tw = mc.textRenderer.getWidth(s);
+                          int y = 4 + i * 11;
+                          int c = ModuleManager.color(i);
+                          ctx.fill(w - tw - 8, y - 1, w - 2, y + 10, 0x80000000);
+                          ctx.fill(w - 2, y - 1, w, y + 10, c | 0xFF000000);
+                          ctx.drawTextWithShadow(mc.textRenderer, s, w - tw - 5, y + 1, c);
+                      }
+                  }
+              }
+
+              /** Радужный цвет текста HUD. */
+              public static class Rainbow extends Module {
+                  public Rainbow() { super("Rainbow", Category.VISUAL); }
+                  @Override public void onEnable() { ModuleManager.rainbow = true; }
+                  @Override public void onDisable() { ModuleManager.rainbow = false; }
+              }
+
+              /** Яркость (ночное зрение, только на клиенте). */
+              public static class Fullbright extends Module {
+                  public Fullbright() { super("Fullbright", Category.VISUAL); }
+                  @Override public void onTick() {
+                      if (mc.player == null) return;
+                      mc.player.addStatusEffect(new StatusEffectInstance(
+                              StatusEffects.NIGHT_VISION, 400, 0, false, false, false));
+                  }
+                  @Override public void onDisable() {
+                      if (mc.player != null) mc.player.removeStatusEffect(StatusEffects.NIGHT_VISION);
+                  }
+              }
+
+              public static class Zoom extends Module {
+                  private int oldFov = 70;
+                  public Zoom() { super("Zoom", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      ModuleManager.off(WideFov.class);
+                      oldFov = mc.options.getFov().getValue();
+                      mc.options.getFov().setValue(30);
+                  }
+                  @Override public void onDisable() { mc.options.getFov().setValue(oldFov); }
+              }
+
+              public static class WideFov extends Module {
+                  private int oldFov = 70;
+                  public WideFov() { super("Wide FOV", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      ModuleManager.off(Zoom.class);
+                      oldFov = mc.options.getFov().getValue();
+                      mc.options.getFov().setValue(110);
+                  }
+                  @Override public void onDisable() { mc.options.getFov().setValue(oldFov); }
+              }
+
+              /** Всегда день (только визуально, на сервере время не меняется). */
+              public static class AlwaysDay extends Module {
+                  public AlwaysDay() { super("Always Day", Category.VISUAL); }
+                  @Override public void onEnable() { ModuleManager.off(AlwaysNight.class); }
+                  @Override public void onTick() {
+                      if (mc.world != null) mc.world.setTimeOfDay(6000L);
+                  }
+              }
+
+              public static class AlwaysNight extends Module {
+                  public AlwaysNight() { super("Always Night", Category.VISUAL); }
+                  @Override public void onEnable() { ModuleManager.off(AlwaysDay.class); }
+                  @Override public void onTick() {
+                      if (mc.world != null) mc.world.setTimeOfDay(18000L);
+                  }
+              }
+
+              /** Убирает дождь и грозу (визуально). */
+              public static class NoRain extends Module {
+                  public NoRain() { super("No Rain", Category.VISUAL); }
+                  @Override public void onTick() {
+                      if (mc.world == null) return;
+                      mc.world.setRainGradient(0f);
+                      mc.world.setThunderGradient(0f);
+                  }
+              }
+
+              // ============================ MISC ============================
+
+              public static class ToggleSprint extends Module {
+                  public ToggleSprint() { super("Toggle Sprint", Category.MISC); }
+                  @Override public void onTick() {
+                      if (mc.player == null) return;
+                      if (mc.options.forwardKey.isPressed()
+                              && !mc.player.isSneaking()
+                              && !mc.player.horizontalCollision
+                              && mc.player.getHungerManager().getFoodLevel() > 6) {
+                          mc.player.setSprinting(true);
+                      }
+                  }
+              }
+
+              public static class ToggleSneak extends Module {
+                  public ToggleSneak() { super("Toggle Sneak", Category.MISC); }
+                  @Override public void onTick() { mc.options.sneakKey.setPressed(true); }
+                  @Override public void onDisable() { mc.options.sneakKey.setPressed(false); }
+              }
+
+              /** Автоматически возрождает после смерти. */
+              public static class AutoRespawn extends Module {
+                  public AutoRespawn() { super("Auto Respawn", Category.MISC); }
+                  @Override public void onTick() {
+                      if (mc.player != null && mc.currentScreen instanceof DeathScreen) {
+                          mc.player.requestRespawn();
+                          mc.setScreen(null);
+                      }
+                  }
+              }
+
+              // ============================ ДОПОЛНИТЕЛЬНО: INFO ============================
+
+              public static class DateHud extends Module {
+                  private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("dd.MM.yyyy");
+                  public DateHud() { super("Date", Category.INFO); }
+                  @Override public String info() { return "Date: " + LocalDate.now().format(FMT); }
+              }
+
+              public static class MoonHud extends Module {
+                  public MoonHud() { super("Moon Phase", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.world == null) return null;
+                      return "Moon phase: " + mc.world.getMoonPhase() + "/7";
+                  }
+              }
+
+              public static class PlayersHud extends Module {
+                  public PlayersHud() { super("Players Online", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.getNetworkHandler() == null) return null;
+                      return "Players: " + mc.getNetworkHandler().getPlayerList().size();
+                  }
+              }
+
+              public static class BlockInfo extends Module {
+                  public BlockInfo() { super("Block Info", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.world == null || mc.crosshairTarget == null) return null;
+                      if (mc.crosshairTarget.getType() != HitResult.Type.BLOCK) return null;
+                      if (!(mc.crosshairTarget instanceof BlockHitResult br)) return null;
+                      return "Block: " + mc.world.getBlockState(br.getBlockPos()).getBlock().getName().getString();
+                  }
+              }
+
+              public static class FreeSlots extends Module {
+                  public FreeSlots() { super("Free Slots", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      int free = 0;
+                      for (ItemStack s : mc.player.getInventory().main) if (s.isEmpty()) free++;
+                      return "Free slots: " + free + "/36";
+                  }
+              }
+
+              public static class Cooldowns extends Module {
+                  public Cooldowns() { super("Cooldowns", Category.INFO); }
+                  @Override public List<String> lines() {
+                      if (mc.player == null) return null;
+                      Item[] items = { Items.ENDER_PEARL, Items.CHORUS_FRUIT, Items.SHIELD };
+                      String[] names = { "Pearl", "Chorus", "Shield" };
+                      List<String> out = new ArrayList<>();
+                      for (int i = 0; i < items.length; i++) {
+                          float p = mc.player.getItemCooldownManager().getCooldownProgress(items[i], 0f);
+                          if (p > 0f) out.add(names[i] + ": " + (int) (p * 100) + "%");
+                      }
+                      return out.isEmpty() ? null : out;
+                  }
+              }
+
+              // ============================ ДОПОЛНИТЕЛЬНО: HUD ============================
+
+              public static class LowHpWarning extends Module {
+                  public LowHpWarning() { super("Low HP Warning", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null || mc.player.getHealth() > 6f) return;
+                      ctx.drawCenteredTextWithShadow(mc.textRenderer, "LOW HP!", w / 2, h / 2 - 30, 0xFF5555);
+                  }
+              }
+
+              public static class DurabilityWarning extends Module {
+                  public DurabilityWarning() { super("Durability Warning", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      boolean low = false;
+                      for (ItemStack s : mc.player.getInventory().armor) {
+                          if (!s.isEmpty() && s.isDamageable()
+                                  && (s.getMaxDamage() - s.getDamage()) * 10 < s.getMaxDamage()) low = true;
+                      }
+                      if (low) ctx.drawCenteredTextWithShadow(mc.textRenderer, "ARMOR LOW!", w / 2, h / 2 - 42, 0xFFAA00);
+                  }
+              }
+
+              // ============================ ДОПОЛНИТЕЛЬНО: VISUAL ============================
+
+              /** Показывает хитбоксы (как F3+B). */
+              public static class Hitboxes extends Module {
+                  public Hitboxes() { super("Hitboxes", Category.VISUAL); }
+                  @Override public void onEnable() { mc.getEntityRenderDispatcher().setRenderHitboxes(true); }
+                  @Override public void onDisable() { mc.getEntityRenderDispatcher().setRenderHitboxes(false); }
+              }
+
+              public static class MinimalParticles extends Module {
+                  private ParticlesMode old = ParticlesMode.ALL;
+                  public MinimalParticles() { super("Minimal Particles", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getParticles().getValue();
+                      mc.options.getParticles().setValue(ParticlesMode.MINIMAL);
+                  }
+                  @Override public void onDisable() { mc.options.getParticles().setValue(old); }
+              }
+
+              public static class NoClouds extends Module {
+                  private CloudRenderMode old = CloudRenderMode.FANCY;
+                  public NoClouds() { super("No Clouds", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getCloudRenderMode().getValue();
+                      mc.options.getCloudRenderMode().setValue(CloudRenderMode.OFF);
+                  }
+                  @Override public void onDisable() { mc.options.getCloudRenderMode().setValue(old); }
+              }
+
+              public static class NoBobbing extends Module {
+                  private boolean old = true;
+                  public NoBobbing() { super("No Bobbing", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getBobView().getValue();
+                      mc.options.getBobView().setValue(false);
+                  }
+                  @Override public void onDisable() { mc.options.getBobView().setValue(old); }
+              }
+
+              public static class NoShadows extends Module {
+                  private boolean old = true;
+                  public NoShadows() { super("No Shadows", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getEntityShadows().getValue();
+                      mc.options.getEntityShadows().setValue(false);
+                  }
+                  @Override public void onDisable() { mc.options.getEntityShadows().setValue(old); }
+              }
+
+              /** Убирает изменение FOV при беге и эффектах. */
+              public static class StaticFov extends Module {
+                  private double old = 1.0;
+                  public StaticFov() { super("Static FOV", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getFovEffectScale().getValue();
+                      mc.options.getFovEffectScale().setValue(0.0);
+                  }
+                  @Override public void onDisable() { mc.options.getFovEffectScale().setValue(old); }
+              }
+
+              // ============================ ЕЩЁ: INFO ============================
+
+              public static class TargetName extends Module {
+                  public TargetName() { super("Target Name", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.targetedEntity == null) return null;
+                      return "Target: " + mc.targetedEntity.getName().getString();
+                  }
+              }
+
+              public static class EntityCount extends Module {
+                  public EntityCount() { super("Entities", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.world == null) return null;
+                      int n = 0;
+                      for (Entity e : mc.world.getEntities()) n++;
+                      return "Entities: " + n;
+                  }
+              }
+
+              public static class ChunkHud extends Module {
+                  public ChunkHud() { super("Chunk", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return "Chunk: " + mc.player.getChunkPos().x + " / " + mc.player.getChunkPos().z;
+                  }
+              }
+
+              public static class DimensionHud extends Module {
+                  public DimensionHud() { super("Dimension", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.world == null) return null;
+                      return "Dimension: " + mc.world.getRegistryKey().getValue().getPath();
+                  }
+              }
+
+              public static class GamemodeHud extends Module {
+                  public GamemodeHud() { super("Gamemode", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.interactionManager == null || mc.interactionManager.getCurrentGameMode() == null) return null;
+                      return "Gamemode: " + mc.interactionManager.getCurrentGameMode().getName();
+                  }
+              }
+
+              public static class FallHud extends Module {
+                  public FallHud() { super("Fall Distance", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return String.format("Fall: %.1f", mc.player.fallDistance);
+                  }
+              }
+
+              public static class AirHud extends Module {
+                  public AirHud() { super("Air", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null || mc.player.getAir() >= mc.player.getMaxAir()) return null;
+                      return "Air: " + (mc.player.getAir() / 20) + " s";
+                  }
+              }
+
+              public static class ArmorValueHud extends Module {
+                  public ArmorValueHud() { super("Armor Value", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return "Armor: " + mc.player.getArmor();
+                  }
+              }
+
+              public static class AttackCooldownHud extends Module {
+                  public AttackCooldownHud() { super("Attack Cooldown", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return "Attack: " + (int) (mc.player.getAttackCooldownProgress(0f) * 100) + "%";
+                  }
+              }
+
+              public static class WeatherHud extends Module {
+                  public WeatherHud() { super("Weather", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.world == null) return null;
+                      return "Weather: " + (mc.world.isThundering() ? "thunder" : mc.world.isRaining() ? "rain" : "clear");
+                  }
+              }
+
+              public static class ResolutionHud extends Module {
+                  public ResolutionHud() { super("Resolution", Category.INFO); }
+                  @Override public String info() {
+                      return "Res: " + mc.getWindow().getFramebufferWidth() + "x" + mc.getWindow().getFramebufferHeight();
+                  }
+              }
+
+              public static class MovementHud extends Module {
+                  public MovementHud() { super("Movement State", Category.INFO); }
+                  @Override public String info() {
+                      if (mc.player == null) return null;
+                      return "State: " + (mc.player.isSneaking() ? "sneaking" : mc.player.isSprinting() ? "sprinting" : "walking");
+                  }
+              }
+
+              // ============================ ЕЩЁ: HUD ============================
+
+              public static class CustomCrosshair extends Module {
+                  public CustomCrosshair() { super("Custom Crosshair", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      int cx = w / 2, cy = h / 2;
+                      int c = (ModuleManager.rainbow ? ModuleManager.color(0) : 0xFF55FFFF) | 0xFF000000;
+                      ctx.fill(cx - 9, cy, cx - 4, cy + 1, c);
+                      ctx.fill(cx + 4, cy, cx + 9, cy + 1, c);
+                      ctx.fill(cx, cy - 9, cx + 1, cy - 4, c);
+                      ctx.fill(cx, cy + 4, cx + 1, cy + 9, c);
+                  }
+              }
+
+              public static class OffhandHud extends Module {
+                  public OffhandHud() { super("Offhand HUD", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      ItemStack s = mc.player.getOffHandStack();
+                      if (s.isEmpty()) return;
+                      int x = w - 22, y = h / 2 + 44;
+                      ctx.drawItem(s, x, y);
+                      ctx.drawItemInSlot(mc.textRenderer, s, x, y);
+                  }
+              }
+
+              public static class HealthBar extends Module {
+                  public HealthBar() { super("Health Bar", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      int bw = 100, x = (w - bw) / 2, y = 36;
+                      float max = Math.max(1f, mc.player.getMaxHealth());
+                      float frac = Math.min(1f, mc.player.getHealth() / max);
+                      ctx.fill(x - 1, y - 1, x + bw + 1, y + 7, 0xAA000000);
+                      ctx.fill(x, y, x + (int) (bw * frac), y + 6, frac > 0.3f ? 0xFF55FF55 : 0xFFFF5555);
+                  }
+              }
+
+              public static class Compass extends Module {
+                  private static final String[] N = { "S", "SW", "W", "NW", "N", "NE", "E", "SE" };
+                  private static final float[] A = { 0f, 45f, 90f, 135f, 180f, -135f, -90f, -45f };
+                  public Compass() { super("Compass", Category.HUD); }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (mc.player == null) return;
+                      float yaw = mc.player.getYaw();
+                      for (int i = 0; i < N.length; i++) {
+                          float d = MathHelper.wrapDegrees(A[i] - yaw);
+                          if (Math.abs(d) < 75f) {
+                              ctx.drawCenteredTextWithShadow(mc.textRenderer, N[i], (int) (w / 2 + d * 1.6f), 16, ModuleManager.color(i));
+                          }
+                      }
+                      ctx.fill(w / 2, 26, w / 2 + 1, 29, 0xFFFF5555);
+                  }
+              }
+
+              public static class FpsGraph extends Module {
+                  private final Deque<Integer> samples = new ArrayDeque<>();
+                  public FpsGraph() { super("FPS Graph", Category.HUD); }
+                  @Override public void onTick() {
+                      samples.addLast(mc.getCurrentFps());
+                      while (samples.size() > 60) samples.pollFirst();
+                  }
+                  @Override public void onRender(DrawContext ctx, int w, int h) {
+                      if (samples.isEmpty()) return;
+                      int max = 1;
+                      for (int v : samples) max = Math.max(max, v);
+                      int x = w - 70, y = h - 120, gh = 30, i = 0;
+                      ctx.fill(x - 1, y - 1, x + 61, y + gh + 1, 0x80000000);
+                      for (int v : samples) {
+                          int bar = Math.max(1, v * gh / max);
+                          ctx.fill(x + i, y + gh - bar, x + i + 1, y + gh, 0xFF55FF55);
+                          i++;
+                      }
+                  }
+              }
+
+              // ============================ ЕЩЁ: VISUAL ============================
+
+              /** Прозрачный фон чата. */
+              public static class ClearChat extends Module {
+                  private double old = 0.5;
+                  public ClearChat() { super("Clear Chat", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getTextBackgroundOpacity().getValue();
+                      mc.options.getTextBackgroundOpacity().setValue(0.0);
+                  }
+                  @Override public void onDisable() { mc.options.getTextBackgroundOpacity().setValue(old); }
+              }
+
+              public static class FastGraphics extends Module {
+                  private GraphicsMode old = GraphicsMode.FANCY;
+                  public FastGraphics() { super("Fast Graphics", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getGraphicsMode().getValue();
+                      mc.options.getGraphicsMode().setValue(GraphicsMode.FAST);
+                  }
+                  @Override public void onDisable() { mc.options.getGraphicsMode().setValue(old); }
+              }
+
+              public static class UnlimitedFps extends Module {
+                  private int old = 120;
+                  public UnlimitedFps() { super("Unlimited FPS", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getMaxFps().getValue();
+                      mc.options.getMaxFps().setValue(260);
+                  }
+                  @Override public void onDisable() { mc.options.getMaxFps().setValue(old); }
+              }
+
+              public static class VsyncOff extends Module {
+                  private boolean old = true;
+                  public VsyncOff() { super("VSync Off", Category.VISUAL); }
+                  @Override public void onEnable() {
+                      old = mc.options.getEnableVsync().getValue();
+                      mc.options.getEnableVsync().setValue(false);
+                  }
+                  @Override public void onDisable() { mc.options.getEnableVsync().setValue(old); }
+              }
+
+              // ============================ ЕЩЁ: MISC ============================
+
+              public static class AutoJumpOff extends Module {
+                  private boolean old = false;
+                  public AutoJumpOff() { super("Auto Jump Off", Category.MISC); }
+                  @Override public void onEnable() {
+                      old = mc.options.getAutoJump().getValue();
+                      mc.options.getAutoJump().setValue(false);
+                  }
+                  @Override public void onDisable() { mc.options.getAutoJump().setValue(old); }
+              }
+
+              public static class MuteMusic extends Module {
+                  private double old = 1.0;
+                  public MuteMusic() { super("Mute Music", Category.MISC); }
+                  @Override public void onEnable() {
+                      old = mc.options.getSoundVolumeOption(SoundCategory.MUSIC).getValue();
+                      mc.options.getSoundVolumeOption(SoundCategory.MUSIC).setValue(0.0);
+                  }
+                  @Override public void onDisable() { mc.options.getSoundVolumeOption(SoundCategory.MUSIC).setValue(old); }
+              }
+          }
+          EOF_FILE
+          mkdir -p src/main/resources/assets/visualmod/lang
+          cat > src/main/resources/assets/visualmod/lang/en_us.json <<'EOF_FILE'
+          {
+            "key.visual.open": "Open Visual menu",
+            "category.visual": "Visual Mod"
+          }
+          EOF_FILE
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'EOF_FILE'
+          {
+            "schemaVersion": 1,
+            "id": "visualmod",
+            "version": "${version}",
+            "name": "Visual Mod",
+            "description": "HUD и визуальные функции. Меню на Right Shift.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.bob.visual.VisualClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.15.0",
+              "minecraft": "~1.20.1",
+              "java": ">=17",
+              "fabric-api": "*"
+            }
+          }
+          EOF_FILE
+      - name: Build
+        run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visualmod
+          path: build/libs/*.jar
